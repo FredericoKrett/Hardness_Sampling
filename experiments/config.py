@@ -6,6 +6,8 @@ from sklearn.svm import SVC
 import strategies.hardness as ih
 from strategies.random import random_sampling
 from strategies.expected_error import expected_error_reduction
+from strategies.hierarchical import hierarchical_sampling
+from strategies.mcm import mcm_sampling
 from strategies.information_density import (density_weighted_sampling,
                                             training_utility_sampling)
 
@@ -34,6 +36,8 @@ SAMPLING_METHODS = [
     density_weighted_sampling,
     training_utility_sampling,
     expected_error_reduction,
+    hierarchical_sampling,
+    mcm_sampling,
     ih.borderline_points_sampling,
     ih.class_balance_sampling,
     ih.class_likelihood_sampling,
