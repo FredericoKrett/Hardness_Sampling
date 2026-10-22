@@ -79,7 +79,7 @@ ABREV_DICT = {
 
     "class_balance_sampling": "CB",
 
-    "minority_value_sampling": "MV"
+    "minority_value_sampling": "MV",
 
     "expected_error_reduction": r"EER$_{ent}$",
 

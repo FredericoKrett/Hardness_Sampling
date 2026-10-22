@@ -137,19 +137,32 @@ class _HierTreeSampler:
 def hierarchical_sampling(learner: ActiveLearner, X: np.ndarray, n_instances: int = 1) -> np.ndarray:
     """Estratégia Hier (Dasgupta & Hsu, 2008) compatível com modAL."""
     if len(X) <= n_instances:
-        return np.arange(len(X))
+        return np.arange(len(X), dtype=int)
 
-    if not hasattr(learner, "_hier_sampler"):
-        n_l0 = len(learner.X_training)
-        n_u0 = len(X)
+    y_tr = np.asarray(learner.y_training).ravel()
+    n_l = len(y_tr)
+    n_u = len(X)
+
+    if not hasattr(learner, "_hier_sampler") or learner._hier_sampler.n != (n_l + n_u):
         X_full = np.vstack([learner.X_training, X])
         learner._hier_sampler = _HierTreeSampler(X_full, random_state=get_seed())
-        learner._hier_labeled_leaves = list(range(n_l0))
-        learner._hier_pool_leaves = np.arange(n_l0, n_l0 + n_u0)
+        learner._hier_labeled_leaves = list(range(n_l))
+        learner._hier_pool_leaves = np.arange(n_l, n_l + n_u, dtype=int)
+        learner._hier_pending_leaves = []
+        learner._hier_pending_local = np.array([], dtype=int)
+
+    if len(learner._hier_labeled_leaves) < n_l and len(learner._hier_pending_leaves) > 0:
+        learner._hier_labeled_leaves.extend(learner._hier_pending_leaves)
+        learner._hier_pool_leaves = np.delete(learner._hier_pool_leaves, learner._hier_pending_local)
+        learner._hier_pending_leaves = []
+        learner._hier_pending_local = np.array([], dtype=int)
+
+    if len(learner._hier_pending_local) == n_instances and len(learner._hier_labeled_leaves) == n_l:
+        return learner._hier_pending_local
 
     chosen_leaves = learner._hier_sampler.select_leaves(
-        labeled_leaves=np.array(learner._hier_labeled_leaves, dtype=int),
-        y_labeled=np.asarray(learner.y_training),
+        labeled_leaves=np.array(learner._hier_labeled_leaves[:n_l], dtype=int),
+        y_labeled=y_tr,
         available_leaves=learner._hier_pool_leaves,
         batch_size=n_instances,
     )
@@ -157,7 +170,7 @@ def hierarchical_sampling(learner: ActiveLearner, X: np.ndarray, n_instances: in
     leaf_to_local = {int(leaf): idx for idx, leaf in enumerate(learner._hier_pool_leaves)}
     local_indices = np.array([leaf_to_local[leaf] for leaf in chosen_leaves], dtype=int)
 
-    learner._hier_labeled_leaves.extend(chosen_leaves)
-    learner._hier_pool_leaves = np.delete(learner._hier_pool_leaves, local_indices)
+    learner._hier_pending_leaves = chosen_leaves
+    learner._hier_pending_local = local_indices
 
     return local_indices
