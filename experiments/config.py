@@ -14,6 +14,15 @@ from strategies.information_density import (density_weighted_sampling,
 
 # total number of instances queried during the active learning process
 N_QUERIES = 100
+N_QUERIES_REDUCED = 50
+
+# mapeamento automatico de queries conforme o tamanho inicial L0
+QUERIES_BY_INIT = {
+    5: N_QUERIES,           # 100 queries (configurcao padrao)
+    100: N_QUERIES_REDUCED, # 50 queries
+    500: N_QUERIES_REDUCED, # 50 queries
+    1000: N_QUERIES_REDUCED # 50 queries
+}
 
 # number of instances selected in each active learning iteration
 BATCH_SIZES = [1, 5, 10, 25]

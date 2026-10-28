@@ -24,7 +24,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 RANDOM_STATE = 42
 
-REPO_ROOT = Path("/content/drive/MyDrive/hardness_sampling_svc")
+REPO_ROOT = Path("/content/drive/MyDrive/hardness_sampling_hier_mcm")
 
 RESULTS_ROOT = REPO_ROOT / "results"
 FAILURE_LOG_DIR = REPO_ROOT / "logs"
@@ -34,8 +34,11 @@ FAILURE_LOG_DIR = REPO_ROOT / "logs"
 # PASTA DOS RESULTADOS
 # ============================================================
 
-def get_results_dir(batch_size):
-    results_dir = RESULTS_ROOT / f"svc_batch{batch_size}"
+def get_results_dir(batch_size, initial_size):
+    if initial_size == 5:
+        results_dir = RESULTS_ROOT / f"svc_batch{batch_size}"
+    else:
+        results_dir = RESULTS_ROOT / f"init{initial_size}" / f"svc_batch{batch_size}"
     results_dir.mkdir(parents=True, exist_ok=True)
     return results_dir
 
@@ -44,8 +47,8 @@ def get_results_dir(batch_size):
 # NOME DO ARQUIVO DE RESULTADO
 # ============================================================
 
-def get_result_file(dataset_file, classifier_name, query_strategy, batch_size):
-    results_dir = get_results_dir(batch_size)
+def get_result_file(dataset_file, classifier_name, query_strategy, batch_size, initial_size):
+    results_dir = get_results_dir(batch_size, initial_size)
     dataset_name = Path(dataset_file).stem
 
     filename = "_".join([
@@ -58,21 +61,19 @@ def get_result_file(dataset_file, classifier_name, query_strategy, batch_size):
     return results_dir / filename
 
 
-def get_initial_labeled_size():
-    return 5  # mesmo default do ActiveLearningExperiment original
-
-
 # ============================================================
-# NÚMERO ESPERADO DE LINHAS
+# FILTRO DE DATASETS E NÚMERO ESPERADO DE LINHAS
 # ============================================================
 
-def get_expected_rows(dataset_file, batch_size):
+def inspect_dataset(dataset_file, batch_size, initial_size):
     data = pd.read_csv(dataset_file)
     X = data.iloc[:, :-1].to_numpy()
     y = data.iloc[:, -1].to_numpy()
 
-    initial_labeled_size = get_initial_labeled_size()
-    n_queries = config.N_QUERIES // batch_size
+    n_classes = len(np.unique(y))
+    effective_init = max(initial_size, n_classes)
+    total_queries = config.QUERIES_BY_INIT[initial_size]
+    n_queries = total_queries // batch_size
 
     skf = StratifiedKFold(n_splits=config.N_SPLITS, shuffle=True,
                           random_state=RANDOM_STATE)
@@ -80,23 +81,22 @@ def get_expected_rows(dataset_file, batch_size):
     total_rows = 0
     for train_index, test_index in skf.split(X, y):
         train_size = len(train_index)
-        pool_size = train_size - initial_labeled_size
+        # Filtra datasets onde o fold de treino nao comporta L0 + total_queries
+        if train_size < effective_init + total_queries:
+            return False, 0
 
-        if pool_size <= 0:
-            executed_queries = 0
-        else:
-            executed_queries = min(n_queries, math.ceil(pool_size / batch_size))
-
+        pool_size = train_size - effective_init
+        executed_queries = min(n_queries, math.ceil(pool_size / batch_size))
         total_rows += 1 + executed_queries  # query 0 + cada query realizada
 
-    return total_rows * config.N_RUNS
+    return True, total_rows * config.N_RUNS
 
 
 # ============================================================
 # VERIFICAÇÃO DO CSV
 # ============================================================
 
-def csv_is_complete(result_file, dataset_file, batch_size):
+def csv_is_complete(result_file, expected_rows):
     if not result_file.exists():
         return False
     if result_file.stat().st_size == 0:
@@ -114,8 +114,7 @@ def csv_is_complete(result_file, dataset_file, batch_size):
                 return False
             rows = list(reader)
 
-        expected = get_expected_rows(dataset_file, batch_size)
-        if len(rows) != expected:
+        if len(rows) != expected_rows:
             return False
 
         df = pd.DataFrame(rows)
@@ -147,7 +146,7 @@ def csv_is_complete(result_file, dataset_file, batch_size):
 # PREPARAÇÃO DOS EXPERIMENTOS
 # ============================================================
 
-def prepare_experiments(batch_size):
+def prepare_experiments(batch_size, initial_size):
     csv_dir = REPO_ROOT / "datasets" / "csv"
     datasets = sorted(str(file) for file in csv_dir.glob("*.csv"))
     if not datasets:
@@ -156,22 +155,30 @@ def prepare_experiments(batch_size):
     classifier_name = "SVC"
     repair_jobs = []
     new_jobs = []
+    valid_datasets = 0
 
     for dataset_file in datasets:
+        is_valid, expected_rows = inspect_dataset(dataset_file, batch_size, initial_size)
+        if not is_valid:
+            continue
+
+        valid_datasets += 1
+
         for query_strategy in config.SAMPLING_METHODS:
             result_file = get_result_file(dataset_file, classifier_name,
-                                          query_strategy, batch_size)
-            complete = csv_is_complete(result_file, dataset_file, batch_size)
+                                          query_strategy, batch_size, initial_size)
+            complete = csv_is_complete(result_file, expected_rows)
 
             if complete:
                 continue
 
+            job = (dataset_file, classifier_name, query_strategy, batch_size, initial_size)
             if result_file.exists():
-                repair_jobs.append((dataset_file, classifier_name, query_strategy, batch_size))
+                repair_jobs.append(job)
             else:
-                new_jobs.append((dataset_file, classifier_name, query_strategy, batch_size))
+                new_jobs.append(job)
 
-    return repair_jobs, new_jobs
+    return repair_jobs, new_jobs, valid_datasets, len(datasets)
 
 
 # ============================================================
@@ -179,10 +186,11 @@ def prepare_experiments(batch_size):
 # ============================================================
 
 def run_experiment(args):
-    dataset_file, classifier_name, query_strategy, batch_size = args
+    dataset_file, classifier_name, query_strategy, batch_size, initial_size = args
     estimator = config.CLASSIFIER_DICT[classifier_name]
-    results_dir = get_results_dir(batch_size)
-    n_queries = config.N_QUERIES // batch_size
+    results_dir = get_results_dir(batch_size, initial_size)
+    total_queries = config.QUERIES_BY_INIT[initial_size]
+    n_queries = total_queries // batch_size
 
     try:
         experiment = ActiveLearningExperiment(
@@ -192,6 +200,7 @@ def run_experiment(args):
             n_queries=n_queries,
             n_runs=config.N_RUNS,
             n_folds=config.N_SPLITS,
+            initial_labeled_size=initial_size,
             batch_size=batch_size,
             results_dir=str(results_dir),
             random_state=RANDOM_STATE,
@@ -204,8 +213,6 @@ def run_experiment(args):
 
 
 def run_jobs_and_report(jobs, batch_size, desc):
-    """Roda um Pool sobre `jobs` sem deixar uma falha derrubar as demais,
-    e devolve a lista de falhas para reportar/registrar no final."""
     failures = []
     with Pool(config.N_WORKERS) as pool:
         for ok, dataset_file, method_name, batch, error in tqdm(
@@ -219,18 +226,17 @@ def run_jobs_and_report(jobs, batch_size, desc):
     return failures
 
 
-def save_failure_log(failures, batch_size):
+def save_failure_log(failures, batch_size, initial_size):
     if not failures:
         return
     FAILURE_LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = FAILURE_LOG_DIR / f"failures_batch{batch_size}.log"
+    log_path = FAILURE_LOG_DIR / f"failures_init{initial_size}_batch{batch_size}.log"
     with open(log_path, "w", encoding="utf-8") as f:
         for dataset_file, method_name, batch, error in failures:
             f.write(f"{'='*70}\n{Path(dataset_file).stem} | {method_name} | batch{batch}\n")
             f.write(error + "\n")
     print(f"\n{len(failures)} falha(s) registradas em: {log_path}")
-    print("Rode o script novamente para tentar refazer essas combinações "
-         "(elas ficaram sem CSV completo, então serão reconhecidas como pendentes).")
+    print("Rode o script novamente para tentar refazer essas combinações.")
 
 
 # ============================================================
@@ -240,45 +246,42 @@ def save_failure_log(failures, batch_size):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
-        description="Executa um batch do experimento SVC com recuperação de resultados."
+        description="Executa um batch do experimento SVC com filtragem por tamanho inicial."
     )
     parser.add_argument("--batch-size", type=int, required=True, choices=[1, 5, 10, 25],
                         help="Batch size: 1, 5, 10 ou 25.")
+    parser.add_argument("--initial-size", type=int, default=100, choices=[5, 100, 500, 1000],
+                        help="Tamanho inicial rotulado L0: 5, 100, 500 ou 1000.")
     parser.add_argument("--workers", type=int, default=os.cpu_count(),
-                        help="Processos paralelos (default: núcleos reais da máquina, "
-                             "via os.cpu_count(); ignora config.N_WORKERS).")
+                        help="Processos paralelos.")
     args = parser.parse_args()
     batch_size = args.batch_size
+    initial_size = args.initial_size
+    total_queries = config.QUERIES_BY_INIT[initial_size]
 
     if args.workers < 1:
         raise ValueError("--workers deve ser pelo menos 1.")
     config.N_WORKERS = args.workers
 
-    results_dir = get_results_dir(batch_size)
+    results_dir = get_results_dir(batch_size, initial_size)
     existing_files = list(results_dir.glob("*.csv"))
 
+    repair_jobs, new_jobs, valid_ds, total_ds = prepare_experiments(batch_size, initial_size)
+
     print()
     print("=" * 70)
-    print("EXPERIMENTO SVC")
+    print(f"EXPERIMENTO SVC | L0 = {initial_size} | N_QUERIES = {total_queries}")
     print("=" * 70)
-    print(f"Repo root:  {REPO_ROOT}  (existe: {REPO_ROOT.exists()})")
-    print(f"Batch:      {batch_size}")
-    print(f"Workers:    {config.N_WORKERS}  (núcleos detectados: {os.cpu_count()})")
-    print(f"Resultados: {results_dir}")
-    print(f"CSVs já presentes nessa pasta (antes de checar completude): {len(existing_files)}")
+    print(f"Repo root:        {REPO_ROOT}  (existe: {REPO_ROOT.exists()})")
+    print(f"Batch:            {batch_size}")
+    print(f"Initial size L0:  {initial_size}")
+    print(f"Datasets válidos: {valid_ds}/{total_ds} (mínimo de {initial_size + total_queries} instâncias no treino)")
+    print(f"Workers:          {config.N_WORKERS}  (núcleos detectados: {os.cpu_count()})")
+    print(f"Resultados:       {results_dir}")
+    print(f"CSVs já na pasta: {len(existing_files)}")
+    print(f"CSV incompletos:  {len(repair_jobs)}")
+    print(f"CSV novos:        {len(new_jobs)}")
     print("=" * 70)
-    print()
-
-    if len(existing_files) == 0:
-        print("[ATENÇÃO] A pasta de resultados parece vazia. Se você esperava "
-             "encontrar arquivos de uma execução anterior, PARE agora e confira "
-             "se o Google Drive terminou de montar/sincronizar antes de continuar "
-             "-- senão o experimento vai reprocessar tudo do zero.\n")
-
-    repair_jobs, new_jobs = prepare_experiments(batch_size)
-
-    print(f"CSV incompletos: {len(repair_jobs)}")
-    print(f"CSV novos:       {len(new_jobs)}")
     print()
 
     all_failures = []
@@ -289,13 +292,15 @@ if __name__ == "__main__":
         print("=" * 70)
 
         for job in repair_jobs:
-            dataset_file, classifier_name, query_strategy, batch = job
-            result_file = get_result_file(dataset_file, classifier_name, query_strategy, batch)
+            dataset_file, classifier_name, query_strategy, batch, init_sz = job
+            result_file = get_result_file(dataset_file, classifier_name, query_strategy, batch, init_sz)
             print(f"Excluindo: {result_file.name}")
             result_file.unlink()
         print()
 
-        all_failures += run_jobs_and_report(repair_jobs, batch_size, f"Refazendo batch {batch_size}")
+        all_failures += run_jobs_and_report(
+            repair_jobs, batch_size, f"Refazendo L0={initial_size} batch={batch_size}"
+        )
         print("\nCSV incompletos processados.\n")
 
     if new_jobs:
@@ -303,17 +308,19 @@ if __name__ == "__main__":
         print("EXECUTANDO NOVOS EXPERIMENTOS")
         print("=" * 70)
 
-        all_failures += run_jobs_and_report(new_jobs, batch_size, f"Executando batch {batch_size}")
+        all_failures += run_jobs_and_report(
+            new_jobs, batch_size, f"Executando L0={initial_size} batch={batch_size}"
+        )
         print("\nNovos experimentos processados.\n")
 
-    save_failure_log(all_failures, batch_size)
+    save_failure_log(all_failures, batch_size, initial_size)
 
     print("=" * 70)
     if not repair_jobs and not new_jobs:
-        print(f"BATCH {batch_size} JÁ ESTÁ COMPLETO")
+        print(f"L0={initial_size} | BATCH {batch_size} JÁ ESTÁ COMPLETO")
     elif all_failures:
-        print(f"BATCH {batch_size} FINALIZADO COM {len(all_failures)} FALHA(S) -- veja o log acima")
+        print(f"L0={initial_size} | BATCH {batch_size} FINALIZADO COM {len(all_failures)} FALHA(S)")
     else:
-        print(f"BATCH {batch_size} FINALIZADO SEM FALHAS")
+        print(f"L0={initial_size} | BATCH {batch_size} FINALIZADO SEM FALHAS")
     print(f"Resultados: {results_dir}")
     print("=" * 70)

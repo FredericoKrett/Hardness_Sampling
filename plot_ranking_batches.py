@@ -1,5 +1,6 @@
 import os
 import warnings
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +12,7 @@ import colorcet as cc
 warnings.filterwarnings("ignore")
 
 REPO_ROOT = Path(
-    "/content/drive/MyDrive/hardness_sampling_svc"
+    "/content/drive/MyDrive/hardness_sampling_hier_mcm"
 )
 
 RESULTS_ROOT = REPO_ROOT / "results"
@@ -26,9 +27,16 @@ SMOOTHING_WINDOW = {
     25: 1
 }
 
+MAX_QUERIES_BY_INIT = {
+    5: 100,
+    100: 50,
+    500: 50,
+    1000: 50
+}
+
 
 # ============================================================
-# 24 MÉTODOS
+# 26 MÉTODOS
 # ============================================================
 
 ABREV_DICT = {
@@ -42,6 +50,10 @@ ABREV_DICT = {
     "density_weighted_sampling": "ID",
 
     "expected_error_reduction": r"EER$_{ent}$",
+
+    "hierarchical_sampling": "Hier",
+
+    "mcm_sampling": "MCM",
 
     "borderline_points_sampling": "N1I",
 
@@ -80,12 +92,6 @@ ABREV_DICT = {
     "class_balance_sampling": "CB",
 
     "minority_value_sampling": "MV",
-
-    "expected_error_reduction": r"EER$_{ent}$",
-
-    "hierarchical_sampling": "Hier",
-
-    "mcm_sampling": "MCM",
 }
 
 
@@ -215,19 +221,32 @@ COLOR_DICT["random_sampling"] = "firebrick"
 
 
 # ============================================================
+# CAMINHOS POR TAMANHO INICIAL
+# ============================================================
+
+def get_results_dir_for_plot(batch_size, initial_size):
+    if initial_size == 5:
+        return RESULTS_ROOT / f"svc_batch{batch_size}"
+    return RESULTS_ROOT / f"init{initial_size}" / f"svc_batch{batch_size}"
+
+
+def get_plot_dir(initial_size):
+    if initial_size == 5:
+        return PLOT_ROOT
+    return PLOT_ROOT / f"init{initial_size}"
+
+
+# ============================================================
 # CARREGAR CSVs
 # ============================================================
 
-def load_results(batch_size):
+def load_results(batch_size, initial_size):
 
-    results_dir = (
-        RESULTS_ROOT
-        / f"svc_batch{batch_size}"
-    )
+    results_dir = get_results_dir_for_plot(batch_size, initial_size)
 
     print()
     print("=" * 75)
-    print(f"BATCH {batch_size}")
+    print(f"L0 = {initial_size} | BATCH {batch_size}")
     print("=" * 75)
     print(f"Pasta: {results_dir}")
 
@@ -327,8 +346,6 @@ def load_results(batch_size):
     # SVC
     # ========================================================
 
-    # Usa case-insensitive para evitar o problema
-    # de "SVC", "svc", etc.
     results_df = results_df[
         results_df["classifier"]
         .str.upper()
@@ -336,7 +353,7 @@ def load_results(batch_size):
     ].copy()
 
     # ========================================================
-    # SOMENTE OS 24 MÉTODOS
+    # SOMENTE OS 26 MÉTODOS
     # ========================================================
 
     results_df = results_df[
@@ -394,12 +411,17 @@ def load_results(batch_size):
 
 
 # ============================================================
-# REMOVER OS 10 PIORES
+# REMOVER OS 10 PIORES (APENAS QUANDO HÁ >= 75 DATASETS)
 # ============================================================
 
 def remove_worst_datasets(
-    results_df
+    results_df,
+    initial_size
 ):
+    # Nos cenarios filtrados (L0 = 100, 500, 1000), mantemos os datasets validos
+    # ou removemos os 10 piores apenas no cenario completo (L0 = 5)
+    if initial_size != 5 or results_df["dataset"].nunique() <= 15:
+        return results_df.copy(), []
 
     datasets_to_rm = (
 
@@ -460,12 +482,6 @@ def get_avg_ranks(
     results_df
 ):
 
-    # --------------------------------------------------------
-    # Média de Kappa por:
-    #
-    # classifier / method / query / dataset
-    # --------------------------------------------------------
-
     avg_kappa = (
 
         results_df
@@ -483,12 +499,6 @@ def get_avg_ranks(
 
         .mean()
     )
-
-    # --------------------------------------------------------
-    # Rank:
-    #
-    # maior Kappa = rank 1
-    # --------------------------------------------------------
 
     ranks_df = (
         avg_kappa
@@ -514,10 +524,6 @@ def get_avg_ranks(
             ascending=False
         )
     )
-
-    # --------------------------------------------------------
-    # Rank médio entre datasets
-    # --------------------------------------------------------
 
     avg_ranks = (
 
@@ -545,7 +551,8 @@ def get_avg_ranks(
 
 def plot_learning_curves(
     avg_ranks_df,
-    batch_size
+    batch_size,
+    initial_size
 ):
 
     fig, ax = plt.subplots(
@@ -557,20 +564,23 @@ def plot_learning_curves(
     ax.invert_yaxis()
 
     # --------------------------------------------------------
-    # EIXO X
+    # EIXO X DINÂMICO (100 PARA L0=5, 50 PARA L0=100/500/1000)
     # --------------------------------------------------------
+
+    max_q = MAX_QUERIES_BY_INIT.get(initial_size, 50)
+    step_x = 10 if max_q == 100 else 5
 
     ax.set_xticks(
         np.arange(
             0,
-            101,
-            10
+            max_q + 1,
+            step_x
         )
     )
 
     ax.set_xlim(
         0,
-        110
+        int(max_q * 1.1)
     )
 
     ax.set_xlabel(
@@ -610,14 +620,9 @@ def plot_learning_curves(
         sort=False
     ):
 
-        # Ordena query
         data = data.sort_index(
             level="query"
         )
-
-        # ----------------------------------------------------
-        # Transforma em DataFrame
-        # ----------------------------------------------------
 
         temp = (
             data
@@ -628,10 +633,6 @@ def plot_learning_curves(
                 "query"
             )
         )
-
-        # ----------------------------------------------------
-        # Média móvel
-        # ----------------------------------------------------
 
         window = SMOOTHING_WINDOW[
             batch_size
@@ -651,19 +652,11 @@ def plot_learning_curves(
             .to_numpy()
         )
 
-        # ----------------------------------------------------
-        # AUC para ordenar a legenda
-        # ----------------------------------------------------
-
         auc_scores[
             ABREV_DICT[method]
         ] = np.trapz(
             smoothed
         )
-
-        # ----------------------------------------------------
-        # QUERY -> INSTÂNCIAS CONSULTADAS
-        # ----------------------------------------------------
 
         queries = (
             temp["query"]
@@ -675,10 +668,6 @@ def plot_learning_curves(
             queries
             * batch_size
         )
-
-        # ----------------------------------------------------
-        # PLOT
-        # ----------------------------------------------------
 
         ax.plot(
 
@@ -742,7 +731,6 @@ def plot_learning_curves(
         key=auc_scores.get
     )
 
-    # Só coloca na legenda o que realmente foi plotado.
     sorted_labels = [
         label
         for label in sorted_labels
@@ -782,121 +770,96 @@ def plot_learning_curves(
 
 
 # ============================================================
-# EXECUTAR 1, 5, 10 E 25
+# EXECUTAR
 # ============================================================
 
-PLOT_ROOT.mkdir(
-    parents=True,
-    exist_ok=True
-)
+if __name__ == "__main__":
 
-
-for batch_size in BATCH_SIZES:
-
-    results_df = load_results(
-        batch_size
+    parser = argparse.ArgumentParser(
+        description="Plota curvas de ranking para os cenários de L0 e batch sizes."
     )
+    parser.add_argument(
+        "--initial-sizes",
+        type=int,
+        nargs="+",
+        default=[100, 500, 1000],
+        choices=[5, 100, 500, 1000],
+        help="Quais tamanhos iniciais plotar (default: 100 500 1000)."
+    )
+    args = parser.parse_args()
 
-    if results_df is None:
-        continue
+    for initial_size in args.initial_sizes:
 
-    if results_df.empty:
-
-        print(
-            f"\n[ERRO] Batch {batch_size}: "
-            "nenhum dado SVC encontrado."
+        plot_dir = get_plot_dir(initial_size)
+        plot_dir.mkdir(
+            parents=True,
+            exist_ok=True
         )
 
-        continue
+        for batch_size in BATCH_SIZES:
 
-    # ========================================================
-    # REMOVER OS 10 PIORES
-    # ========================================================
+            results_df = load_results(
+                batch_size,
+                initial_size
+            )
 
-    results_df, removed = (
-        remove_worst_datasets(
-            results_df
-        )
-    )
+            if results_df is None or results_df.empty:
+                continue
+
+            results_df, removed = (
+                remove_worst_datasets(
+                    results_df,
+                    initial_size
+                )
+            )
+
+            if removed:
+                print("\nDatasets removidos:")
+                for dataset in removed:
+                    print("  -", dataset)
+
+            avg_ranks_df = (
+                get_avg_ranks(
+                    results_df
+                )
+            )
+
+            fig = plot_learning_curves(
+                avg_ranks_df,
+                batch_size,
+                initial_size
+            )
+
+            if fig is None:
+                continue
+
+            suffix = f"_init{initial_size}" if initial_size != 5 else ""
+            output_base = (
+                plot_dir
+                / f"ranking_curve_SVC_batch{batch_size}{suffix}"
+            )
+
+            fig.savefig(
+                f"{output_base}.png",
+                dpi=300,
+                bbox_inches="tight"
+            )
+
+            fig.savefig(
+                f"{output_base}.eps",
+                format="eps",
+                bbox_inches="tight"
+            )
+
+            print()
+            print("Salvo:")
+            print(f"  {output_base}.png")
+            print(f"  {output_base}.eps")
+
+            plt.show()
+            plt.close(fig)
 
     print()
-    print(
-        "Datasets removidos:"
-    )
-
-    for dataset in removed:
-
-        print(
-            "  -",
-            dataset
-        )
-
-    # ========================================================
-    # RANKING
-    # ========================================================
-
-    avg_ranks_df = (
-        get_avg_ranks(
-            results_df
-        )
-    )
-
-    # ========================================================
-    # GRÁFICO
-    # ========================================================
-
-    fig = plot_learning_curves(
-        avg_ranks_df,
-        batch_size
-    )
-
-    if fig is None:
-        continue
-
-    # ========================================================
-    # SALVAR
-    # ========================================================
-
-    output_base = (
-        PLOT_ROOT
-        / f"ranking_curve_SVC_batch{batch_size}"
-    )
-
-    fig.savefig(
-        f"{output_base}.png",
-        dpi=300,
-        bbox_inches="tight"
-    )
-
-    fig.savefig(
-        f"{output_base}.eps",
-        format="eps",
-        bbox_inches="tight"
-    )
-
-    print()
-    print(
-        f"Salvo:"
-    )
-
-    print(
-        f"  {output_base}.png"
-    )
-
-    print(
-        f"  {output_base}.eps"
-    )
-
-    plt.show()
-
-    plt.close(fig)
-
-
-print()
-print("=" * 75)
-print("CONCLUÍDO")
-print("=" * 75)
-print()
-print(
-    f"Gráficos em:\n{PLOT_ROOT}"
-)
+    print("=" * 75)
+    print("CONCLUÍDO")
+    print("=" * 75)
