@@ -11,12 +11,17 @@ import colorcet as cc
 
 warnings.filterwarnings("ignore")
 
-REPO_ROOT = Path(
+_DRIVE_ROOT = Path(
     "/content/drive/MyDrive/hardness_sampling_hier_mcm"
+)
+REPO_ROOT = (
+    _DRIVE_ROOT
+    if _DRIVE_ROOT.exists()
+    else Path(__file__).resolve().parent
 )
 
 RESULTS_ROOT = REPO_ROOT / "results"
-PLOT_ROOT = REPO_ROOT / "plots_ranking"
+PLOT_ROOT = REPO_ROOT / "plots_svc"
 
 BATCH_SIZES = [1, 5, 10, 25]
 
@@ -92,6 +97,8 @@ ABREV_DICT = {
     "class_balance_sampling": "CB",
 
     "minority_value_sampling": "MV",
+
+    "kdn_adj": r"$\mathrm{kDN}_{adj}$",
 }
 
 
@@ -117,6 +124,7 @@ CLASSIC = {
 NEIGHBORHOOD = {
     "borderline_points_sampling",
     "k_disagreeing_neighbors_sampling",
+    "kdn_adj",
     "local_set_cardinality_sampling",
     "ls_radius_sampling",
     "intra_extra_ratio_sampling",
@@ -438,7 +446,7 @@ def remove_worst_datasets(
         .kappa
 
         .apply(
-            np.trapz
+            np.trapezoid if hasattr(np, "trapezoid") else np.trapz
         )
 
         .groupby(
@@ -654,8 +662,10 @@ def plot_learning_curves(
 
         auc_scores[
             ABREV_DICT[method]
-        ] = np.trapz(
-            smoothed
+        ] = (
+            np.trapezoid(smoothed)
+            if hasattr(np, "trapezoid")
+            else np.trapz(smoothed)
         )
 
         queries = (

@@ -24,7 +24,8 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 RANDOM_STATE = 42
 
-REPO_ROOT = Path("/content/drive/MyDrive/hardness_sampling_hier_mcm")
+_DRIVE_ROOT = Path("/content/drive/MyDrive/hardness_sampling_hier_mcm")
+REPO_ROOT = _DRIVE_ROOT if _DRIVE_ROOT.exists() else Path(__file__).resolve().parent.parent
 
 RESULTS_ROOT = REPO_ROOT / "results"
 FAILURE_LOG_DIR = REPO_ROOT / "logs"
