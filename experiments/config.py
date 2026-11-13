@@ -26,6 +26,7 @@ from strategies.hardness import (
     usefulness_sampling,
 )
 from strategies.hierarchical import hierarchical_sampling
+from strategies.hier_kdn import hier_kdn_sampling
 from strategies.information_density import (
     density_weighted_sampling,
     training_utility_sampling,
@@ -72,7 +73,7 @@ LOG_DIR = 'logs/'
 
 N_WORKERS = 48
 
-# Lista completa (27 estratégias) para L0 = 5
+# Lista completa (28 estratégias) para L0 = 5
 ALL_SAMPLING_METHODS = [
     random_sampling,
     margin_sampling,
@@ -81,6 +82,7 @@ ALL_SAMPLING_METHODS = [
     training_utility_sampling,
     k_disagreeing_neighbors_sampling,
     kdn_adj,
+    hier_kdn_sampling,
     disjunct_size_sampling,
     disjunct_class_percentage_sampling,
     tree_depth_pruned_sampling,
@@ -103,7 +105,7 @@ ALL_SAMPLING_METHODS = [
     mcm_sampling,
 ]
 
-# Top 10 consolidado via Friedman-Nemenyi + kdn_adj (para L0 = 100, 500, 1000)
+# Top 10 consolidado via Friedman-Nemenyi + kdn_adj + hier_kdn (para L0 = 100, 500, 1000)
 TOP_SAMPLING_METHODS = [
     hierarchical_sampling,
     random_sampling,
@@ -116,6 +118,7 @@ TOP_SAMPLING_METHODS = [
     borderline_points_sampling,
     ls_radius_sampling,
     kdn_adj,
+    hier_kdn_sampling,
 ]
 
 SAMPLING_METHODS = ALL_SAMPLING_METHODS

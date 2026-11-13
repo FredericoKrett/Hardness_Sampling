@@ -1,22 +1,31 @@
 import argparse
 import glob
+import math
+import os
 import warnings
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from scipy.stats import friedmanchisquare, studentized_range
 import matplotlib.pyplot as plt
+from scipy.stats import friedmanchisquare, studentized_range
 
 warnings.filterwarnings("ignore")
 
 _DRIVE_ROOT = Path("/content/drive/MyDrive/hardness_sampling_hier_mcm")
-REPO_ROOT = _DRIVE_ROOT if _DRIVE_ROOT.exists() else Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = (
+    _DRIVE_ROOT
+    if _DRIVE_ROOT.exists()
+    else (SCRIPT_DIR.parent if SCRIPT_DIR.name == "experiments" else SCRIPT_DIR)
+)
 RESULTS_ROOT = REPO_ROOT / "results"
-OUT_DIR = REPO_ROOT / "friedman"
+PLOTS_ROOT = REPO_ROOT / "friedman"
 
 ABBR = {
     "k_disagreeing_neighbors_sampling": "kDN",
     "kdn_adj": r"$\mathrm{kDN}_{adj}$",
+    "hier_kdn_sampling": "Hier+kDN",
     "hierarchical_sampling": "Hier",
     "mcm_sampling": "MCM",
     "ls_radius_sampling": "LSR",
@@ -46,210 +55,372 @@ ABBR = {
     "density_weighted_sampling": "ID",
 }
 
+TOP_METHODS_INIT = [
+    "hier_kdn_sampling",
+    "hierarchical_sampling",
+    "k_disagreeing_neighbors_sampling",
+    "random_sampling",
+    "disjunct_size_sampling",
+    "mcm_sampling",
+    "local_set_cardinality_sampling",
+    "harmfulness_sampling",
+    "borderline_points_sampling",
+    "class_likeliood_diff_sampling",
+    "ls_radius_sampling",
+    "kdn_adj",
+]
 
-def load_clean_auc_matrix(batch_size, initial_size=5):
+
+def compute_cd_nemenyi(k: int, N: int, alpha: float = 0.05) -> float:
+    q_alpha = studentized_range.ppf(1.0 - alpha, k, np.inf) / np.sqrt(2.0)
+    return float(q_alpha * np.sqrt(k * (k + 1.0) / (6.0 * N)))
+
+
+def find_maximal_cliques(mean_ranks: pd.Series, cd: float):
+    ranks = mean_ranks.values
+    k = len(ranks)
+    cliques = []
+    for i in range(k):
+        j = i
+        while j + 1 < k and (ranks[j + 1] - ranks[i]) <= cd + 1e-9:
+            j += 1
+        if j > i:
+            is_sub = any(prev_i <= i and j <= prev_j for prev_i, prev_j in cliques)
+            if not is_sub:
+                cliques.append((i, j))
+    return cliques
+
+
+def load_observations(
+    batch_size: int,
+    initial_size: int = 5,
+    classifier: str = "SVC",
+    remove_n_worst: int = 10,
+    by_fold: bool = True,
+    max_queries: int = None,
+):
     folder = (
         RESULTS_ROOT / f"svc_batch{batch_size}"
         if initial_size == 5
         else RESULTS_ROOT / f"init{initial_size}" / f"svc_batch{batch_size}"
     )
 
-    min_steps = max(2, min(10, 50 // batch_size))
+    if not folder.exists():
+        print(f"Pasta não encontrada: {folder}")
+        return pd.DataFrame(), [], 0
 
-    records = []
-    for csv_path in glob.glob(str(folder / "*.csv")):
+    all_csvs = sorted(glob.glob(str(folder / "*.csv")))
+    svc_csvs = [
+        f for f in all_csvs
+        if f"_{classifier}_" in os.path.basename(f)
+        or not any(c in os.path.basename(f) for c in ("_5NN_", "_DecisionTree_", "_GaussianNB_"))
+    ]
+
+    dfs = []
+    for csv_path in svc_csvs:
         try:
-            df = pd.read_csv(
-                csv_path,
-                usecols=["dataset", "method", "run", "fold", "query", "kappa"]
-            )
+            df = pd.read_csv(csv_path)
             if df.empty:
                 continue
-            curve = (
-                df.groupby(["dataset", "method", "query"])["kappa"]
-                .mean()
-                .reset_index()
-            )
-            records.append(curve)
+            if "classifier" in df.columns:
+                df = df[df["classifier"] == classifier]
+            if not df.empty:
+                dfs.append(df[["dataset", "method", "fold", "query", "kappa"]])
         except Exception:
             continue
 
-    if not records:
-        return pd.DataFrame()
+    if not dfs:
+        return pd.DataFrame(), [], 0
 
-    full_curves = pd.concat(records, ignore_index=True)
-    total_methods = full_curves["method"].nunique()
+    results_df = pd.concat(dfs, ignore_index=True)
+    if initial_size != 5:
+        results_df = results_df[results_df["method"].isin(TOP_METHODS_INIT)].copy()
 
-    auc_rows = []
-    for ds, df_ds in full_curves.groupby("dataset"):
-        if df_ds["method"].nunique() < total_methods:
-            continue
+    if results_df.empty:
+        return pd.DataFrame(), [], 0
 
-        query_counts = df_ds.groupby("query")["method"].nunique()
-        common_queries = query_counts[query_counts == total_methods].index
+    results_df = results_df.sort_values(["dataset", "method", "fold", "query"])
 
-        if len(common_queries) < min_steps:
-            continue
+    if max_queries is not None and max_queries > 0:
+        results_df["step"] = results_df.groupby(["dataset", "method", "fold"]).cumcount()
+        max_steps = max(2, max_queries // batch_size)
+        results_df = results_df[results_df["step"] <= max_steps]
 
-        df_common = df_ds[df_ds["query"].isin(common_queries)].sort_values("query")
-        for m, df_m in df_common.groupby("method"):
-            y = df_m["kappa"].values
-            if len(y) > 1:
-                auc_val = (
-                    np.trapezoid(y) / (len(y) - 1)
-                    if hasattr(np, "trapezoid")
-                    else np.trapz(y) / (len(y) - 1)
-                )
-            else:
-                auc_val = float(y[0])
-            auc_rows.append({"dataset": ds, "method": m, "auc": auc_val})
+    alp_D_df = (
+        results_df.groupby(["dataset", "method", "fold"])["kappa"]
+        .apply(np.trapezoid if hasattr(np, "trapezoid") else np.trapz)
+        .rename("ALP")
+        .reset_index()
+    )
 
-    if not auc_rows:
-        return pd.DataFrame()
+    total_methods = alp_D_df["method"].nunique()
+    ds_method_counts = alp_D_df.groupby("dataset")["method"].nunique()
+    valid_datasets = ds_method_counts[ds_method_counts == total_methods].index
+    alp_D_df = alp_D_df[alp_D_df["dataset"].isin(valid_datasets)]
 
-    auc_df = pd.DataFrame(auc_rows)
-    pivot = auc_df.pivot_table(index="dataset", columns="method", values="auc")
-    return pivot.dropna(axis=0, how="any")
+    removed_datasets = []
+    if remove_n_worst > 0 and alp_D_df["dataset"].nunique() > remove_n_worst:
+        datasets_to_rm = (
+            alp_D_df.groupby(["dataset", "method"])["ALP"]
+            .mean()
+            .groupby("dataset")
+            .max()
+            .sort_values()
+            .head(remove_n_worst)
+            .index
+        )
+        removed_datasets = list(datasets_to_rm)
+        alp_D_df = alp_D_df[~alp_D_df["dataset"].isin(datasets_to_rm)]
+
+    n_datasets = alp_D_df["dataset"].nunique()
+
+    if by_fold:
+        observations_df = alp_D_df.pivot(
+            index=["dataset", "fold"], columns="method", values="ALP"
+        ).dropna(axis=0, how="any")
+    else:
+        observations_df = (
+            alp_D_df.groupby(["dataset", "method"])["ALP"]
+            .mean()
+            .unstack("method")
+            .dropna(axis=0, how="any")
+        )
+
+    return observations_df, removed_datasets, n_datasets
 
 
-def find_maximal_cliques(ranks, cd):
-    k = len(ranks)
-    cliques = []
-    for i in range(k):
-        j = i
-        while j + 1 < k and (ranks[j + 1] - ranks[i]) < cd:
-            j += 1
-        if j > i:
-            if not cliques or j > cliques[-1][1]:
-                cliques.append((i, j))
-    return cliques
+def draw_cd_diagram(
+    ax,
+    mean_ranks: pd.Series,
+    cd: float,
+    title: str = "",
+):
+    mean_ranks = mean_ranks.sort_values(ascending=True)
+    k = len(mean_ranks)
+    methods = list(mean_ranks.index)
+    ranks = mean_ranks.values
 
+    n_right = math.ceil(k / 2.0)
+    n_left = k - n_right
 
-def plot_demsar_cd_diagram(avg_ranks, cd, out_path, title=None):
-    methods_sorted = list(avg_ranks.index)
-    ranks_sorted = avg_ranks.values
-    k = len(methods_sorted)
-
-    n_right = (k + 1) // 2
-    right_methods = methods_sorted[:n_right]
-    right_ranks = ranks_sorted[:n_right]
-
-    left_methods = methods_sorted[n_right:][::-1]
-    left_ranks = ranks_sorted[n_right:][::-1]
-
-    cliques = find_maximal_cliques(ranks_sorted, cd)
+    cliques = find_maximal_cliques(mean_ranks, cd)
     n_cliques = len(cliques)
 
-    max_rows = max(len(right_methods), len(left_methods))
-    clique_space = max(1.2, n_cliques * 0.38 + 0.6)
-    y_axis = max_rows * 0.55 + clique_space + 1.0
-    fig_height = max(5.5, y_axis + 1.4)
+    y_axis = 1.0
+    y_cd = 1.45
+    clique_start_y = 0.68
+    clique_step_y = 0.22
+    label_start_y = clique_start_y - max(1, n_cliques) * clique_step_y - 0.25
+    label_step_y = 0.36
 
-    fig, ax = plt.subplots(figsize=(12, fig_height), dpi=300)
+    n_rows = max(n_right, n_left)
+    y_min = label_start_y - n_rows * label_step_y - 0.4
+    y_max = 2.05
 
-    def r2x(r):
-        return k + 1 - r
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(y_min, y_max)
+    ax.axis("off")
 
-    x_left_edge = 1.0
-    x_right_edge = float(k)
+    x0, x1 = 0.22, 0.78
 
-    ax.plot([x_left_edge, x_right_edge], [y_axis, y_axis], color="black", lw=1.2)
+    def rank_to_x(r):
+        return x0 + (k - r) / max(1.0, (k - 1.0)) * (x1 - x0)
 
-    for r in range(1, k + 1):
-        x = r2x(r)
-        ax.plot([x, x], [y_axis, y_axis + 0.18], color="black", lw=1.0)
-        ax.text(x, y_axis + 0.28, f"{r}", ha="center", va="bottom", fontsize=10)
-        if r < k:
-            x_half = r2x(r + 0.5)
-            ax.plot([x_half, x_half], [y_axis, y_axis + 0.09], color="black", lw=0.7)
+    ax.plot([x0, x1], [y_axis, y_axis], color="black", lw=1.2)
 
-    y_cd = y_axis + 0.95
-    x_cd_start = x_left_edge
-    x_cd_end = x_left_edge + cd
-    ax.plot([x_cd_start, x_cd_end], [y_cd, y_cd], color="black", lw=1.2)
-    ax.plot([x_cd_start, x_cd_start], [y_cd - 0.15, y_cd + 0.15], color="black", lw=1.2)
-    ax.plot([x_cd_end, x_cd_end], [y_cd - 0.15, y_cd + 0.15], color="black", lw=1.2)
-    ax.text((x_cd_start + x_cd_end) / 2, y_cd + 0.18, "CD", ha="center", va="bottom", fontsize=11)
+    tick_step = 1 if k <= 30 else 2
+    ticks = sorted(set(list(range(1, k + 1, tick_step)) + [1, k]))
+    for t in ticks:
+        xt = rank_to_x(t)
+        ax.plot([xt, xt], [y_axis, y_axis + 0.08], color="black", lw=1.0)
+        ax.text(xt, y_axis + 0.13, f"{t}", ha="center", va="bottom", fontsize=8.5, color="black")
 
-    y_first_clique = y_axis - 0.45
-    for idx_c, (i, j) in enumerate(cliques):
-        y_c = y_first_clique - idx_c * 0.34
-        x1 = r2x(ranks_sorted[j]) - 0.08
-        x2 = r2x(ranks_sorted[i]) + 0.08
-        ax.plot([x1, x2], [y_c, y_c], color="black", lw=3.2, solid_capstyle="butt")
-
-    y_top_label = y_axis - clique_space - 0.3
-    row_step = 0.52
-
-    x_label_right = x_right_edge + 0.6
-    for idx, (m, r) in enumerate(zip(right_methods, right_ranks)):
-        y_row = y_top_label - idx * row_step
-        x_r = r2x(r)
-        label = ABBR.get(m, m)
-        ax.plot([x_r, x_r, x_label_right], [y_axis, y_row, y_row], color="black", lw=0.9)
-        ax.text(x_label_right + 0.25, y_row, label, ha="left", va="center", fontsize=11)
-
-    x_label_left = x_left_edge - 0.6
-    for idx, (m, r) in enumerate(zip(left_methods, left_ranks)):
-        y_row = y_top_label - idx * row_step
-        x_r = r2x(r)
-        label = ABBR.get(m, m)
-        ax.plot([x_r, x_r, x_label_left], [y_axis, y_row, y_row], color="black", lw=0.9)
-        ax.text(x_label_left - 0.25, y_row, label, ha="right", va="center", fontsize=11)
+    cd_width = (cd / max(1.0, (k - 1.0))) * (x1 - x0)
+    x_cd_start = x0
+    x_cd_end = min(x1, x0 + cd_width)
+    ax.plot([x_cd_start, x_cd_end], [y_cd, y_cd], color="black", lw=1.8)
+    ax.plot([x_cd_start, x_cd_start], [y_cd - 0.06, y_cd + 0.06], color="black", lw=1.4)
+    ax.plot([x_cd_end, x_cd_end], [y_cd - 0.06, y_cd + 0.06], color="black", lw=1.4)
+    ax.text(
+        (x_cd_start + x_cd_end) / 2.0,
+        y_cd + 0.10,
+        f"CD = {cd:.2f}",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+        color="black",
+    )
 
     if title:
-        ax.set_title(title, fontsize=11, pad=15)
+        ax.text(
+            0.5,
+            y_max - 0.05,
+            title,
+            ha="center",
+            va="top",
+            fontsize=11,
+            fontweight="bold",
+            color="black",
+        )
 
-    ax.set_xlim(x_left_edge - 4.5, x_right_edge + 4.5)
-    ax.set_ylim(y_top_label - max_rows * row_step - 0.4, y_cd + 0.7)
-    ax.axis("off")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
-    plt.close()
+    for idx_c, (i, j) in enumerate(cliques):
+        yc = clique_start_y - idx_c * clique_step_y
+        xi = rank_to_x(ranks[i])
+        xj = rank_to_x(ranks[j])
+        ax.plot([xj, xi], [yc, yc], color="black", lw=3.0, solid_capstyle="butt")
+
+    for idx in range(n_right):
+        m = methods[idx]
+        r = ranks[idx]
+        xm = rank_to_x(r)
+        ym = label_start_y - idx * label_step_y
+        label = ABBR.get(m, m)
+
+        ax.plot([xm, xm], [y_axis, ym], color="black", lw=0.7, ls="-")
+        ax.plot([xm, x1 + 0.03], [ym, ym], color="black", lw=0.7, ls="-")
+        ax.plot(xm, y_axis, "o", color="black", markersize=3.5)
+        ax.text(
+            x1 + 0.04,
+            ym,
+            f"{r:.2f}  {label}",
+            ha="left",
+            va="center",
+            fontsize=9,
+            color="black",
+        )
+
+    for idx_l in range(n_left):
+        idx = k - 1 - idx_l
+        m = methods[idx]
+        r = ranks[idx]
+        xm = rank_to_x(r)
+        ym = label_start_y - idx_l * label_step_y
+        label = ABBR.get(m, m)
+
+        ax.plot([xm, xm], [y_axis, ym], color="black", lw=0.7, ls="-")
+        ax.plot([x0 - 0.03, xm], [ym, ym], color="black", lw=0.7, ls="-")
+        ax.plot(xm, y_axis, "o", color="black", markersize=3.5)
+        ax.text(
+            x0 - 0.04,
+            ym,
+            f"{label}  {r:.2f}",
+            ha="right",
+            va="center",
+            fontsize=9,
+            color="black",
+        )
 
 
-def main(initial_size=5):
-    out_folder = OUT_DIR if initial_size == 5 else OUT_DIR / f"init{initial_size}"
-    out_folder.mkdir(parents=True, exist_ok=True)
+def run_friedman_analysis(
+    batches=(1, 5, 10, 25),
+    initial_size=5,
+    classifier="SVC",
+    remove_n_worst=10,
+    by_fold=True,
+    max_queries=None,
+    alpha=0.05,
+):
+    eff_rm = remove_n_worst if initial_size == 5 else 0
+    mode_tag = "byfold" if by_fold else "bydataset"
+    suffix = f"bracis_{classifier}_{mode_tag}_init{initial_size}_rm{eff_rm}"
+    out_dir = PLOTS_ROOT / suffix
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_ranks = []
-    for b in [1, 5, 10, 25]:
-        pivot = load_clean_auc_matrix(b, initial_size=initial_size)
-        if pivot.empty:
-            print(f"[AVISO] Sem datasets completos para L0={initial_size} | Batch {b}")
+    all_ranks = {}
+    fig_grid, axes_grid = plt.subplots(2, 2, figsize=(18, 15), dpi=300)
+    axes_flat = axes_grid.flatten()
+
+    for idx_b, b in enumerate(batches):
+        obs_df, removed, n_ds = load_observations(
+            batch_size=b,
+            initial_size=initial_size,
+            classifier=classifier,
+            remove_n_worst=eff_rm,
+            by_fold=by_fold,
+            max_queries=max_queries,
+        )
+        if obs_df.empty:
+            print(f"[L0={initial_size} | Batch {b}] Sem dados suficientes.")
             continue
 
-        n_ds, k_m = pivot.shape
-        stat, p_val = friedmanchisquare(*[pivot[col].values for col in pivot.columns])
-        ranks_df = pivot.rank(axis=1, ascending=False, method="average")
-        avg_ranks = ranks_df.mean(axis=0).sort_values(ascending=True)
+        N_obs, k = obs_df.shape
+        ranks_df = obs_df.rank(axis=1, ascending=False, method="average")
+        mean_ranks = ranks_df.mean(axis=0).sort_values(ascending=True)
+        all_ranks[f"batch_{b}"] = mean_ranks
 
-        q_alpha = studentized_range.ppf(1 - 0.05, k_m, np.inf) / np.sqrt(2)
-        cd = q_alpha * np.sqrt(k_m * (k_m + 1) / (6.0 * n_ds))
+        stat, p_val = friedmanchisquare(*[obs_df[col].values for col in obs_df.columns])
+        cd = compute_cd_nemenyi(k=k, N=N_obs, alpha=alpha)
 
-        all_ranks.append(avg_ranks.rename(f"batch_{b}"))
-
-        img_path = out_folder / f"demsar_cd_L0_{initial_size}_batch{b}.png"
-        plot_demsar_cd_diagram(
-            avg_ranks,
-            cd,
-            img_path,
-            title=f"Batch {b} (L0={initial_size} | N={n_ds} datasets | CD={cd:.2f} | p={p_val:.1e})",
+        print("=" * 75)
+        print(
+            f"BATCH {b} ({classifier}) | L0={initial_size} | Datasets={n_ds} (N_obs={N_obs}) | k={k} métodos"
         )
-        print(f"Salvo: {img_path} (N={n_ds} datasets | CD={cd:.2f})")
+        print(f"Friedman chi2 = {stat:.2f} | p-value = {p_val:.2e} | CD = {cd:.2f}")
+        print("-" * 75)
+        for pos, (m, r_val) in enumerate(mean_ranks.head(12).items(), 1):
+            print(f"  {pos:2d}. {ABBR.get(m, m):10s} ({m:35s}) -> Rank Médio: {r_val:.2f}")
+
+        fig_single, ax_single = plt.subplots(figsize=(10, 7.5), dpi=300)
+        title_str = f"Batch {b} - {classifier} (L0={initial_size} | {n_ds} datasets, N={N_obs} | CD={cd:.2f})"
+        draw_cd_diagram(ax_single, mean_ranks, cd, title=title_str)
+        plt.tight_layout()
+        fig_single.savefig(out_dir / f"friedman_cd_batch{b}.png", dpi=300, bbox_inches="tight")
+        fig_single.savefig(out_dir / f"friedman_cd_batch{b}.eps", format="eps", bbox_inches="tight")
+        plt.close(fig_single)
+
+        if idx_b < 4:
+            draw_cd_diagram(axes_flat[idx_b], mean_ranks, cd, title=title_str)
 
     if all_ranks:
-        summary_df = pd.concat(all_ranks, axis=1)
-        summary_df["mean_rank"] = summary_df.mean(axis=1)
-        summary_df["abbr"] = [ABBR.get(m, m) for m in summary_df.index]
-        summary_df = summary_df.sort_values("mean_rank")
-        summary_df.to_csv(out_folder / f"ranking_consolidado_L0_{initial_size}.csv")
-        print("\nTOP 12 CONSOLIDADO:")
-        print(summary_df.head(12).round(2).to_string())
+        plt.tight_layout()
+        fig_grid.savefig(out_dir / f"friedman_cd_all_batches_{suffix}.png", dpi=300, bbox_inches="tight")
+        fig_grid.savefig(out_dir / f"friedman_cd_all_batches_{suffix}.eps", format="eps", bbox_inches="tight")
+        plt.close(fig_grid)
+
+        ranks_table = pd.DataFrame(all_ranks)
+        ranks_table["mean_across_batches"] = ranks_table.mean(axis=1)
+        ranks_table = ranks_table.sort_values("mean_across_batches", ascending=True)
+        ranks_table.to_csv(out_dir / f"friedman_ranks_summary_{suffix}.csv")
+
+        print("\n" + "=" * 75)
+        print(f"RANKING GLOBAL CONSOLIDADO (L0={initial_size} | {classifier}):")
+        print("=" * 75)
+        for pos, (m, row) in enumerate(ranks_table.iterrows(), 1):
+            b_str = " | ".join(
+                [f"B{b}: {row[f'batch_{b}']:.2f}" for b in batches if f"batch_{b}" in row]
+            )
+            print(
+                f"  {pos:2d}. {ABBR.get(m, m):10s} ({m:35s}) -> Média: {row['mean_across_batches']:.2f}  [{b_str}]"
+            )
+
+        print(f"\nGráficos salvos em: {out_dir}")
+    else:
+        plt.close(fig_grid)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--initial-size", type=int, default=5)
+    parser.add_argument(
+        "--initial-size", "--initial-sizes",
+        dest="initial_sizes",
+        type=int,
+        nargs="+",
+        default=[5],
+        choices=[5, 100, 500, 1000],
+    )
+    parser.add_argument("--classifier", type=str, default="SVC")
+    parser.add_argument("--batches", nargs="+", type=int, default=[1, 5, 10, 25])
+    parser.add_argument("--remove-worst", type=int, default=10)
+    parser.add_argument("--by-dataset", action="store_true")
+    parser.add_argument("--max-queries", type=int, default=None)
     args = parser.parse_args()
-    main(args.initial_size)
+
+    for init_sz in args.initial_sizes:
+        run_friedman_analysis(
+            batches=args.batches,
+            initial_size=init_sz,
+            classifier=args.classifier,
+            remove_n_worst=args.remove_worst,
+            by_fold=not args.by_dataset,
+            max_queries=args.max_queries,
+        )
